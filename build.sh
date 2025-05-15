@@ -1,5 +1,7 @@
 #!/bin/bash
 
+SCRIPT_DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )"
+
 function fail() {
     local error="${*:-Unknown error}"
     echo "$(chalk red "${error}")"
@@ -70,6 +72,7 @@ function build_and_run() {
     # Check if writer.json is specified in the arguments
     local writer_file=""
     local using_iceberg=false
+    local using_iceberggo=false
     
     # Parse the arguments to find the writer.json file path
     local previous_arg=""
@@ -87,12 +90,29 @@ function build_and_run() {
         if grep -qi "iceberg" "$writer_file"; then
             echo "Iceberg destination detected in writer file."
             using_iceberg=true
+        elif grep -qi "\"type\":\s*\"ICEBERGGO\"" "$writer_file"; then
+            echo "Go-based Iceberg destination detected in writer file."
+            using_iceberggo=true
         fi
     fi
     
     # If using iceberg, check and potentially build the JAR
     if [[ "$using_iceberg" == true ]]; then
         check_and_build_jar "iceberg"
+    fi
+
+    # If using Go-based iceberg, make sure the iceberggo directory exists
+    if [[ "$using_iceberggo" == true ]]; then
+        local iceberggo_dir="${SCRIPT_DIR}/writers/new_iceberggo"
+        if [ ! -d "${iceberggo_dir}" ]; then
+            fail "IcebergGo writer directory not found at ${iceberggo_dir}"
+        fi
+        echo "Using native Go-based Iceberg implementation (iceberg-go)"
+    fi
+
+    # Navigate to driver/adapter directory
+    if [ ! -d "$path" ]; then
+        fail "Directory not found: $path"
     fi
     
     cd $path || fail "Failed to navigate to path: $path"
