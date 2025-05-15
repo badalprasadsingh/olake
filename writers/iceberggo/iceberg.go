@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -244,6 +245,9 @@ func toFloat64(value any) (float64, bool) {
 }
 
 func toString(value any) (string, bool) {
+	if value == nil {
+		return "", true
+	}
 	switch v := value.(type) {
 	case string:
 		return v, true
@@ -254,7 +258,7 @@ func toString(value any) (string, bool) {
 	case time.Time:
 		return v.Format(time.RFC3339), true
 	}
-	return "", false
+	return fmt.Sprintf("%v", value), true
 }
 
 // Setup initializes the writer
@@ -268,6 +272,7 @@ func (w *NewIcebergGo) Setup(stream protocol.Stream, options *protocol.Options) 
 		w.config.CatalogType, w.config.RestCatalogURL)
 	logger.Infof("S3 endpoint: %s, region: %s", w.config.S3Endpoint, w.config.AwsRegion)
 	logger.Infof("Iceberg DB: %s, namespace: %s", w.config.IcebergDB, w.config.Namespace)
+	logger.Infof("Handling nil values with appropriate default values (0 for numbers, empty string for text)")
 	
 	ctx := context.Background()
 	
@@ -425,8 +430,8 @@ func (w *NewIcebergGo) createIcebergSchema() ([]iceberg.NestedField, error) {
 			fieldType = iceberg.StringType{}
 		}
 		
-		// Check if the field is nullable
-		isNullable := property.Nullable()
+		// Make all data fields optional to allow our default value handling to work
+		isNullable := true
 		
 		fields = append(fields, iceberg.NestedField{
 			ID:       fieldID,
@@ -547,62 +552,141 @@ func (w *NewIcebergGo) flushRecords() error {
 			// Append the value based on the builder type
 			switch builder := fieldBuilder.(type) {
 			case *array.Int32Builder:
-				if intVal, ok := toInt32(value); ok {
+				if value == nil {
+					// For nil values in integer columns, append 0 instead of null
+					builder.Append(0)
+				} else if intVal, ok := toInt32(value); ok {
 					builder.Append(intVal)
 				} else {
-					builder.AppendNull()
+					// Try to convert to string then to int32, or use 0
+					if strVal, ok := toString(value); ok {
+						if i, err := strconv.ParseInt(strVal, 10, 32); err == nil {
+							builder.Append(int32(i))
+						} else {
+							builder.Append(0)
+						}
+					} else {
+						builder.Append(0)
+					}
 				}
 			case *array.Int64Builder:
-				if intVal, ok := toInt64(value); ok {
+				if value == nil {
+					// For nil values in integer columns, append 0 instead of null
+					builder.Append(0)
+				} else if intVal, ok := toInt64(value); ok {
 					builder.Append(intVal)
 				} else {
-					builder.AppendNull()
+					// Try to convert to string then to int64, or use 0
+					if strVal, ok := toString(value); ok {
+						if i, err := strconv.ParseInt(strVal, 10, 64); err == nil {
+							builder.Append(i)
+						} else {
+							builder.Append(0)
+						}
+					} else {
+						builder.Append(0)
+					}
 				}
 			case *array.Float32Builder:
-				if floatVal, ok := toFloat32(value); ok {
+				if value == nil {
+					// For nil values in float columns, append 0.0 instead of null
+					builder.Append(0.0)
+				} else if floatVal, ok := toFloat32(value); ok {
 					builder.Append(floatVal)
 				} else {
-					builder.AppendNull()
+					// Try to convert to string then to float32, or use 0.0
+					if strVal, ok := toString(value); ok {
+						if f, err := strconv.ParseFloat(strVal, 32); err == nil {
+							builder.Append(float32(f))
+						} else {
+							builder.Append(0.0)
+						}
+					} else {
+						builder.Append(0.0)
+					}
 				}
 			case *array.Float64Builder:
-				if floatVal, ok := toFloat64(value); ok {
+				if value == nil {
+					// For nil values in float columns, append 0.0 instead of null
+					builder.Append(0.0)
+				} else if floatVal, ok := toFloat64(value); ok {
 					builder.Append(floatVal)
 				} else {
-					builder.AppendNull()
+					// Try to convert to string then to float64, or use 0.0
+					if strVal, ok := toString(value); ok {
+						if f, err := strconv.ParseFloat(strVal, 64); err == nil {
+							builder.Append(f)
+						} else {
+							builder.Append(0.0)
+						}
+					} else {
+						builder.Append(0.0)
+					}
 				}
 			case *array.BooleanBuilder:
-				if boolVal, ok := value.(bool); ok {
+				if value == nil {
+					// For nil values in boolean columns, append false instead of null
+					builder.Append(false)
+				} else if boolVal, ok := value.(bool); ok {
 					builder.Append(boolVal)
 				} else {
-					builder.AppendNull()
+					// Try to convert to string representation of boolean
+					if strVal, ok := toString(value); ok {
+						strLower := strings.ToLower(strVal)
+						if strLower == "true" || strLower == "t" || strLower == "1" || strLower == "yes" || strLower == "y" {
+							builder.Append(true)
+						} else {
+							builder.Append(false)
+						}
+					} else {
+						builder.Append(false)
+					}
 				}
 			case *array.StringBuilder:
-				if strVal, ok := toString(value); ok {
+				if value == nil {
+					// For nil values, append empty string instead of null
+					builder.Append("")
+				} else if strVal, ok := toString(value); ok {
 					builder.Append(strVal)
 				} else {
-					builder.AppendNull()
+					// This should never happen as toString handles all types
+					builder.Append("")
 				}
 			case *array.TimestampBuilder:
-				if timeVal, ok := value.(time.Time); ok {
+				if value == nil {
+					// For nil timestamps, use current time instead of null
+					builder.Append(arrow.Timestamp(time.Now().UnixNano()))
+				} else if timeVal, ok := value.(time.Time); ok {
 					builder.Append(arrow.Timestamp(timeVal.UnixNano()))
 				} else if strVal, ok := value.(string); ok {
 					if timeVal, err := time.Parse(time.RFC3339, strVal); err == nil {
 						builder.Append(arrow.Timestamp(timeVal.UnixNano()))
 					} else {
-						builder.AppendNull()
+						// If parsing fails, use current time
+						builder.Append(arrow.Timestamp(time.Now().UnixNano()))
 					}
 				} else {
-					builder.AppendNull()
+					// For all other cases, use current time
+					builder.Append(arrow.Timestamp(time.Now().UnixNano()))
 				}
 			default:
-				// For unsupported types, try to convert to string
-				if strVal, ok := toString(value); ok {
+				// For unsupported types, convert to string
+				if value == nil {
+					if strBuilder, ok := builder.(*array.StringBuilder); ok {
+						strBuilder.Append("")
+					} else {
+						// For non-string builders, use null as last resort
+						builder.AppendNull()
+					}
+				} else if strVal, ok := toString(value); ok {
 					if strBuilder, ok := builder.(*array.StringBuilder); ok {
 						strBuilder.Append(strVal)
 					} else {
+						// Try our best to handle unknown builder types
 						builder.AppendNull()
 					}
 				} else {
+					// This should never happen as toString handles all types
 					builder.AppendNull()
 				}
 			}
