@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/apache/arrow-go/v18/arrow"
@@ -15,7 +16,8 @@ import (
 	"github.com/apache/iceberg-go/catalog"
 	"github.com/apache/iceberg-go/catalog/rest"
 	iceio "github.com/apache/iceberg-go/io"
-	"github.com/apache/iceberg-go/table"
+
+	// "github.com/apache/iceberg-go/table"
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/credentials"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
@@ -27,17 +29,22 @@ import (
 	"github.com/google/uuid"
 )
 
+var globalIcebergMutex sync.Mutex
+
 func (w *NewIcebergGo) Setup(stream protocol.Stream, options *protocol.Options) error {
 	w.stream = stream
-	w.records = make([]types.RawRecord, 0, w.config.BatchSize) // why is 0 passed here?:
+	w.records = make([]types.RawRecord, 0, w.config.BatchSize) // why is 0 passed here?: 
 	w.allocator = memory.NewGoAllocator()
 	w.schemaMapping = make(map[string]int) // Initialize the schema mapping
+	w.writerID = fmt.Sprintf("writer-%s", uuid.New().String()[:8])
 
 	logger.Infof("Setting up ICEBERGGO writer with catalog %s at %s",
 		w.config.CatalogType, w.config.RestCatalogURL)
 	logger.Infof("S3 endpoint: %s, region: %s", w.config.S3Endpoint, w.config.AwsRegion)
 	logger.Infof("Iceberg DB: %s, namespace: %s", w.config.IcebergDB, w.config.Namespace)
 	logger.Infof("Handling nil values with appropriate default values (0 for numbers, empty string for text)")
+	logger.Infof("Initialized writer with ID: %s", w.writerID)
+
 
 	ctx := context.Background()
 	s3Endpoint := w.config.S3Endpoint
@@ -121,6 +128,8 @@ func (w *NewIcebergGo) Setup(stream protocol.Stream, options *protocol.Options) 
 		if errors.Is(err, catalog.ErrNoSuchTable) {
 			tableExists = false
 			logger.Infof("Table %s does not exist", w.tableIdent)
+		} else {
+			return fmt.Errorf("failed to load table: %v", w.tableIdent, err)
 		}
 	} else {
 		tableExists = true
@@ -133,6 +142,7 @@ func (w *NewIcebergGo) Setup(stream protocol.Stream, options *protocol.Options) 
 		}
 
 		logger.Infof("Creating new Iceberg table: %s", w.tableIdent)
+		logger.Infof(w.config.AwsAccessKey, w.config.AwsRegion, w.config.AwsSecretKey, w.config.S3Endpoint)
 		w.iceTable, err = w.catalog.CreateTable(ctx, w.tableIdent, w.schema, catalog.WithProperties(iceberg.Properties{
 			"write.format.default":  "parquet",
 			iceio.S3Region:          w.config.AwsRegion,
@@ -202,7 +212,7 @@ func (w *NewIcebergGo) createRecordBuilder() {
 		})
 	}
 	arrowSchema := arrow.NewSchema(fields, nil)
-	logger.Infof("Arrow schema: %v", arrowSchema)
+	// logger.Infof("Arrow schema: %v", arrowSchema)
 	w.recordBuilder = array.NewRecordBuilder(w.allocator, arrowSchema)
 }
 
@@ -218,10 +228,22 @@ func (w *NewIcebergGo) Write(_ context.Context, record types.RawRecord) error {
 }
 
 func (w *NewIcebergGo) flushRecords() error {
+	// w.mutex.Lock()
+	// defer w.mutex.Unlock()
+
 	if len(w.records) == 0 {
 		return nil
 	}
-	logger.Infof("Flushing %d records to Iceberg", len(w.records))
+
+	if w.recordBuilder == nil {
+		return fmt.Errorf("record builder is nil")
+	}
+
+	if w.iceTable == nil {
+		return fmt.Errorf("iceberg table is nil")
+	}
+
+	logger.Infof("Flushing %d records to Iceberg", w.writerID, len(w.records))
 
 	// Create a new record builder for each flush
 	schema := w.recordBuilder.Schema()
@@ -337,47 +359,74 @@ func (w *NewIcebergGo) flushRecords() error {
 
 	// Add retry logic for transaction conflicts
 	maxRetries := 3
-	var updatedTable *table.Table
 	var err error
 
+	// Step 1: Prepare data outside the lock - generate file path
+	fileUUID := uuid.New().String()
+	filePath := fmt.Sprintf("s3://warehouse/%s/%s/data-%s.parquet",
+		w.config.Namespace, w.stream.Name(), fileUUID)
+
+	// Step 2: Write parquet file outside the lock (this doesn't affect table state)
+	writeFileIO, ok := w.iceTable.FS().(iceio.WriteFileIO)
+	if !ok {
+		return fmt.Errorf("filesystem does not support writing")
+	}
+
+	// Create parquet file with the record
+	fw, err := writeFileIO.Create(filePath)
+	if err != nil {
+		return fmt.Errorf("failed to create parquet file: %v", err)
+	}
+
+	// Write the record to parquet
+	writeErr := pqarrow.WriteTable(arrowTable, fw, record.NumRows(), nil, pqarrow.DefaultWriterProps())
+	closeErr := fw.Close()
+	
+	if writeErr != nil {
+		return fmt.Errorf("failed to write record to parquet: %v", writeErr)
+	}
+	if closeErr != nil {
+		return fmt.Errorf("failed to close parquet file: %v", closeErr)
+	}
+
+	// Only lock during the critical commit phase
+	logger.Infof("[%s] Acquiring global lock for Iceberg commit", w.writerID)
+	globalIcebergMutex.Lock()
+	defer func() {
+		globalIcebergMutex.Unlock()
+		logger.Infof("[%s] Released global lock for Iceberg commit", w.writerID)
+	}()
+
+	// Step 3: Inside the lock, reload the latest table state
+	props := iceberg.Properties{
+		iceio.S3Region:          w.config.AwsRegion,
+		iceio.S3AccessKeyID:     w.config.AwsAccessKey,
+		iceio.S3SecretAccessKey: w.config.AwsSecretKey,
+		iceio.S3EndpointURL:     w.config.S3Endpoint,
+		"s3.path-style-access":  "true",
+	}
+	
+	// Always reload the table inside the lock to get the latest state
+	w.iceTable, err = w.catalog.LoadTable(ctx, w.tableIdent, props)
+	if err != nil {
+		return fmt.Errorf("failed to reload table: %v", err)
+	}
+	logger.Infof("[%s] Loaded latest table state inside lock", w.writerID)
+
 	for attempt := 0; attempt < maxRetries; attempt++ {
-		// Start a new transaction with the latest table state
 		if attempt > 0 {
-			// Reload the table to get the latest state before retry
-			w.iceTable, err = w.catalog.LoadTable(ctx, w.tableIdent, iceberg.Properties{})
+			// Reload the table again if retry needed
+			w.iceTable, err = w.catalog.LoadTable(ctx, w.tableIdent, props)
 			if err != nil {
-				return fmt.Errorf("failed to reload table on retry %d: %v", attempt, err)
+				return fmt.Errorf("failed to reload table on retry %d: %v", attempt+1, err)
 			}
 			logger.Infof("Retrying transaction (attempt %d/%d) after conflict", attempt+1, maxRetries)
 		}
 
+		// Create a new transaction
 		txn := w.iceTable.NewTransaction()
-
-		// Generate a unique file path for this batch
-		fileUUID := uuid.New().String()
-		filePath := fmt.Sprintf("s3://warehouse/%s/%s/data-%s.parquet",
-			w.config.Namespace, w.stream.Name(), fileUUID)
-
-		// Write record to a parquet file using the table's filesystem
-		writeFileIO, ok := w.iceTable.FS().(iceio.WriteFileIO)
-		if !ok {
-			return fmt.Errorf("filesystem does not support writing")
-		}
-
-		// Create parquet file with the record
-		fw, err := writeFileIO.Create(filePath)
-		if err != nil {
-			return fmt.Errorf("failed to create parquet file: %v", err)
-		}
-
-		// Write the record to parquet
-		if err := pqarrow.WriteTable(arrowTable, fw, record.NumRows(), nil, pqarrow.DefaultWriterProps()); err != nil {
-			fw.Close()
-			return fmt.Errorf("failed to write record to parquet: %v", err)
-		}
-
-		if err := fw.Close(); err != nil {
-			return fmt.Errorf("failed to close parquet file: %v", err)
+		if txn == nil {
+			return fmt.Errorf("failed to create transaction (txn is nil)")
 		}
 
 		// Add the data file to the transaction
@@ -387,29 +436,47 @@ func (w *NewIcebergGo) flushRecords() error {
 		}
 
 		// Try to commit the transaction
-		updatedTable, err = txn.Commit(ctx)
+		updatedTable, err := txn.Commit(ctx)
 		if err != nil {
-			// Check if it's a conflict error
-			if strings.Contains(err.Error(), "branch main has changed") ||
-				strings.Contains(err.Error(), "CommitFailedException") {
-				logger.Warnf("Transaction conflict detected: %v, will retry", err)
-				continue // Try again
+			// Check if it's a commit conflict
+			if strings.Contains(err.Error(), "CommitFailedException") || 
+			   strings.Contains(err.Error(), "concurrent") ||
+			   strings.Contains(err.Error(), "conflict") ||
+			   strings.Contains(err.Error(), "branch main has changed") {
+				logger.Warnf("[%s] Commit failed due to concurrent modification (attempt %d/%d): %v", 
+					w.writerID, attempt+1, maxRetries, err)
+				continue // Retry with backoff
 			}
-			// Non-conflict error, return immediately
+			
+			// For other errors, check if it's a catalog/connection issue
+			if strings.Contains(err.Error(), "Failed to get table") ||
+			   strings.Contains(err.Error(), "catalog") ||
+			   strings.Contains(err.Error(), "UncheckedSQLException") {
+				logger.Warnf("[%s] Catalog/connection error (attempt %d/%d): %v", 
+					w.writerID, attempt+1, maxRetries, err)
+				continue // These might be transient, retry
+			}
+			
+			// For unknown errors, still attempt retry for a few times
+			if attempt < 3 {
+				logger.Warnf("[%s] Unknown error, retrying (attempt %d/%d): %v", 
+					w.writerID, attempt+1, maxRetries, err)
+				continue
+			}
+
 			return fmt.Errorf("failed to commit transaction: %v", err)
 		}
 
-		// Success! Break out of the retry loop
+		// Success! Update our table reference and break out of the retry loop
+		w.iceTable = updatedTable
+		logger.Infof("[%s] Successfully committed transaction with %d records", w.writerID, len(w.records))
 		break
 	}
 
-	// If we exhausted retries, check if we have an error
+	// If we exhausted retries, return the last error
 	if err != nil {
 		return fmt.Errorf("failed to commit transaction after %d retries: %v", maxRetries, err)
 	}
-
-	// Update our table reference to the latest version
-	w.iceTable = updatedTable
 
 	// Clear the batch
 	w.records = w.records[:0]

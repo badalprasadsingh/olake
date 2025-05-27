@@ -53,6 +53,9 @@ type NewIcebergGo struct {
 
 	// S3 client for Iceberg operations
 	s3Client *s3.Client
+	// mutex    sync.Mutex
+
+	writerID string
 }
 
 type Config struct {
@@ -758,7 +761,7 @@ func toString(value any) (string, bool) {
 
 // Close handles cleanup
 func (w *NewIcebergGo) Close() error {
-	logger.Infof("Closing ICEBERGGO writer")
+	logger.Infof("Closing ICEBERGGO writer", w.writerID)
 
 	// Flush any remaining records
 	w.recordsMutex.Lock()
@@ -774,6 +777,9 @@ func (w *NewIcebergGo) Close() error {
 	// Clean up resources
 	if w.recordBuilder != nil {
 		w.recordBuilder.Release()
+	}
+	if w.allocator != nil {
+		w.allocator = nil
 	}
 
 	return nil
